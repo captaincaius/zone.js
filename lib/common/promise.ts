@@ -5,6 +5,13 @@
  * Use of this source code is governed by an MIT-style license that can be
  * found in the LICENSE file at https://angular.io/license
  */
+
+function scheduleMacroTaskWithCurrentZone(
+    source: string, callback: Function, data: TaskData, customSchedule: (task: Task) => void,
+    customCancel: (task: Task) => void): MacroTask {
+  return Zone.current.scheduleMacroTask(source, callback, data, customSchedule, customCancel);
+}
+
 interface Promise<T> {
   finally<U>(onFinally?: () => U | PromiseLike<U>): Promise<T>;
 }
@@ -93,6 +100,38 @@ Zone.__load_patch('ZoneAwarePromise', (global: any, Zone: ZoneType, api: _ZonePr
   const RESOLVED = true;
   const REJECTED = false;
   const REJECTED_NO_CATCH = 0;
+
+  const PROMISECONSTRUCT_SOURCE = 'Promise.constructor';
+
+  interface PromiseTaskData extends TaskData {
+    promise: ZoneAwarePromise<any>;
+  }
+
+  function placeholderCallback() {}
+
+  function scheduleTask(task: Task) {
+    return task;
+  }
+
+  function clearTask(task: Task) {
+  }
+
+  function makeTaskAwareResolver(promise: ZoneAwarePromise<any>, state: boolean): (value: any) => void {
+    return (v) => {
+      try {
+        resolvePromise(promise, state, v);
+      } catch (err) {
+        resolvePromise(promise, false, err);
+      }
+      // Do not return value or you will break the Promise spec.
+      const task: Task = (promise as any)['MACROTASK'];
+      if (task && task.state === 'scheduled') {
+        task.invoke();
+      } else if(task) {
+        task.cancelScheduleRequest();
+      }
+    };
+  }
 
   function makeResolver(promise: ZoneAwarePromise<any>, state: boolean): (value: any) => void {
     return (v) => {
@@ -339,10 +378,19 @@ Zone.__load_patch('ZoneAwarePromise', (global: any, Zone: ZoneType, api: _ZonePr
       }
       (promise as any)[symbolState] = UNRESOLVED;
       (promise as any)[symbolValue] = [];  // queue;
-      try {
-        executor && executor(makeResolver(promise, RESOLVED), makeResolver(promise, REJECTED));
-      } catch (error) {
-        resolvePromise(promise, false, error);
+
+      const options: PromiseTaskData = {promise: promise};
+
+      if(executor) {
+        const task = scheduleMacroTaskWithCurrentZone(PROMISECONSTRUCT_SOURCE, placeholderCallback, options, scheduleTask, clearTask);
+        (promise as any)['MACROTASK'] = task;
+
+        try {
+          executor(makeTaskAwareResolver(promise, RESOLVED), makeTaskAwareResolver(promise, REJECTED));
+        } catch (error) {
+          resolvePromise(promise, false, error);
+          task.cancelScheduleRequest();
+        }
       }
     }
 
